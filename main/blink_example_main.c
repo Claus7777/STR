@@ -1,104 +1,163 @@
-/* Blink Example
-
-   This example code is in the Public Domain (or CC0 licensed, at your option.)
-
-   Unless required by applicable law or agreed to in writing, this
-   software is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
-   CONDITIONS OF ANY KIND, either express or implied.
-*/
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/queue.h>
+#include <freertos/timers.h>
+#include <driver/gpio.h>
 #include <stdio.h>
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include "driver/gpio.h"
-#include "esp_log.h"
-#include "led_strip.h"
-#include "sdkconfig.h"
+#include "esp_timer.h"
 
-static const char *TAG = "example";
 
-/* Use project configuration menu (idf.py menuconfig) to choose the GPIO to blink,
-   or you can edit the following line and set a number here.
-*/
-#define BLINK_GPIO CONFIG_BLINK_GPIO
+#define LED_PIN GPIO_NUM_2
+#define BUZZER_PIN GPIO_NUM_4
+#define BUTTON_UP_PIN GPIO_NUM_18
+#define BUTTON_DOWN_PIN GPIO_NUM_19
 
-static uint8_t s_led_state = 0;
+// Constantes
+#define MIN_BPM 40
+#define MAX_BPM 240
+#define DEFAULT_BPM 120
+uint64_t beat_count = 0;
 
-#ifdef CONFIG_BLINK_LED_STRIP
+QueueHandle_t bpm_queue;
+QueueHandle_t bpm_display_queue;
+QueueHandle_t bpm_metronome_queue;
 
-static led_strip_handle_t led_strip;
+typedef struct {
+    int bpm;
+    bool update_display;
+} metronome_state_t;
 
-static void blink_led(void)
-{
-    /* If the addressable LED is enabled */
-    if (s_led_state) {
-        /* Set the LED pixel using RGB from 0 (0%) to 255 (100%) for each color */
-        led_strip_set_pixel(led_strip, 0, 16, 16, 16);
-        /* Refresh the strip to send data */
-        led_strip_refresh(led_strip);
-    } else {
-        /* Set all LED off to clear all pixels */
-        led_strip_clear(led_strip);
+void metronome_task(void *pvParameter) {
+    metronome_state_t state = {DEFAULT_BPM, false};
+    int interval_ms = 60000 / state.bpm; 
+
+    uint64_t start_time_us = esp_timer_get_time();
+    TickType_t last_wake_time = xTaskGetTickCount();
+    
+    while(1) {
+
+        metronome_state_t new_state;
+        if(xQueueReceive(bpm_metronome_queue, &new_state, 0) == pdTRUE) {
+            state.bpm = new_state.bpm;
+            interval_ms = 60000 / state.bpm;
+            printf("BPM atualiado para: %d\n", state.bpm);
+        }
+        
+        uint64_t current_time_us = esp_timer_get_time();
+        uint64_t elapsed_us = current_time_us - start_time_us;
+        double elapsed_ms = elapsed_us / 1000.0;
+        
+        
+        printf("Batida: %.2f ms | Intervalo: %d ms | BPM: %d\n", 
+              elapsed_ms, interval_ms, state.bpm);
+        
+
+        gpio_set_level(LED_PIN, 1);
+        gpio_set_level(BUZZER_PIN, 1);
+        
+
+        vTaskDelay(pdMS_TO_TICKS(50));
+        
+        gpio_set_level(LED_PIN, 0);
+        gpio_set_level(BUZZER_PIN, 0);
+        
+
+        vTaskDelayUntil(&last_wake_time, pdMS_TO_TICKS(interval_ms));
     }
 }
 
-static void configure_led(void)
-{
-    ESP_LOGI(TAG, "Example configured to blink addressable LED!");
-    /* LED strip initialization with the GPIO and pixels number*/
-    led_strip_config_t strip_config = {
-        .strip_gpio_num = BLINK_GPIO,
-        .max_leds = 1, // at least one LED on board
-    };
-#if CONFIG_BLINK_LED_STRIP_BACKEND_RMT
-    led_strip_rmt_config_t rmt_config = {
-        .resolution_hz = 10 * 1000 * 1000, // 10MHz
-        .flags.with_dma = false,
-    };
-    ESP_ERROR_CHECK(led_strip_new_rmt_device(&strip_config, &rmt_config, &led_strip));
-#elif CONFIG_BLINK_LED_STRIP_BACKEND_SPI
-    led_strip_spi_config_t spi_config = {
-        .spi_bus = SPI2_HOST,
-        .flags.with_dma = true,
-    };
-    ESP_ERROR_CHECK(led_strip_new_spi_device(&strip_config, &spi_config, &led_strip));
-#else
-#error "unsupported LED strip backend"
-#endif
-    /* Set all LED off to clear all pixels */
-    led_strip_clear(led_strip);
-}
 
-#elif CONFIG_BLINK_LED_GPIO
+void button_task(void *pvParameter) {
+    metronome_state_t state = {DEFAULT_BPM, true};
+    bool last_up_state = false;
+    bool last_down_state = false;
+    uint64_t start_time_us = esp_timer_get_time();
+    
+    while(1) {
+        bool up_pressed = (gpio_get_level(BUTTON_UP_PIN) == 0);
+        bool down_pressed = (gpio_get_level(BUTTON_DOWN_PIN) == 0);
+        uint64_t current_time_us = esp_timer_get_time();
+        uint64_t elapsed_us = current_time_us - start_time_us;
+        double elapsed_ms = elapsed_us / 1000.0;
+        
+        if(up_pressed && !last_up_state) {
+            state.bpm += 5;
+            if(state.bpm > MAX_BPM) state.bpm = MAX_BPM;
+            state.update_display = true;
 
-static void blink_led(void)
-{
-    /* Set the GPIO level according to the state (LOW or HIGH)*/
-    gpio_set_level(BLINK_GPIO, s_led_state);
-}
+            xQueueSend(bpm_display_queue, &state, portMAX_DELAY);
+            xQueueSend(bpm_metronome_queue, &state, portMAX_DELAY);
+            printf("Apertado! %.2f\n", elapsed_ms);
+        }
+        
+        if(down_pressed && !last_down_state) {
+            state.bpm -= 5;
+            if(state.bpm < MIN_BPM) state.bpm = MIN_BPM;
+            state.update_display = true;
 
-static void configure_led(void)
-{
-    ESP_LOGI(TAG, "Example configured to blink GPIO LED!");
-    gpio_reset_pin(BLINK_GPIO);
-    /* Set the GPIO as a push/pull output */
-    gpio_set_direction(BLINK_GPIO, GPIO_MODE_OUTPUT);
-}
+            xQueueSend(bpm_display_queue, &state, portMAX_DELAY);
+            xQueueSend(bpm_metronome_queue, &state, portMAX_DELAY);
 
-#else
-#error "unsupported LED type"
-#endif
+            printf("Apertado! %.2f\n", elapsed_ms);
+        }
 
-void app_main(void)
-{
-
-    /* Configure the peripheral according to the LED type */
-    configure_led();
-
-    while (1) {
-        ESP_LOGI(TAG, "Turning the LED %s!", s_led_state == true ? "ON" : "OFF");
-        blink_led();
-        /* Toggle the LED state */
-        s_led_state = !s_led_state;
-        vTaskDelay(CONFIG_BLINK_PERIOD / portTICK_PERIOD_MS);
+        
+        last_up_state = up_pressed;
+        last_down_state = down_pressed;
+        
+        vTaskDelay(pdMS_TO_TICKS(50));
     }
+}
+
+
+void display_task(void *pvParameter) {
+    metronome_state_t state = {DEFAULT_BPM, false};
+    
+    while(1) {
+        if(xQueueReceive(bpm_display_queue, &state, portMAX_DELAY) == pdTRUE) {
+            if(state.update_display) {
+                printf("\rMetronomo: %d BPM    ", state.bpm);
+                fflush(stdout);
+
+                UBaseType_t uxHighWaterMark = uxTaskGetStackHighWaterMark(NULL);
+                printf(" | Stack Livre (Display): %u \n", uxHighWaterMark * sizeof(StackType_t));
+            }
+        }
+    }
+}
+
+
+void setup_gpio() {
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << LED_PIN),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+    gpio_config(&io_conf);
+    
+    io_conf.pin_bit_mask = (1ULL << BUZZER_PIN);
+    gpio_config(&io_conf);
+    
+
+    io_conf.pin_bit_mask = (1ULL << BUTTON_UP_PIN) | (1ULL << BUTTON_DOWN_PIN);
+    io_conf.mode = GPIO_MODE_INPUT;
+    io_conf.pull_up_en = GPIO_PULLUP_ENABLE;
+    gpio_config(&io_conf);
+}
+
+void app_main() {
+    setup_gpio();
+    
+    bpm_queue = xQueueCreate(10, sizeof(metronome_state_t));
+    bpm_display_queue = xQueueCreate(10, sizeof(metronome_state_t));
+    bpm_metronome_queue = xQueueCreate(10, sizeof(metronome_state_t));
+    
+    xTaskCreate(metronome_task, "metronome", 2048, NULL, 3, NULL);
+    xTaskCreate(button_task, "buttons", 2048, NULL, 2, NULL);
+    xTaskCreate(display_task, "display", 2048, NULL, 1, NULL);
+    
+    printf("Metronomo ESP32 Iniciado!\n");
+    printf("Use o botão verde para aumentar e o vermelho para diminuir o BPM (%d-%d)\n", MIN_BPM, MAX_BPM);
 }
