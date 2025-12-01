@@ -159,5 +159,5 @@ void app_main() {
     xTaskCreate(display_task, "display", 2048, NULL, 1, NULL);
     
     printf("Metronomo ESP32 Iniciado!\n");
-    printf("Use o botão verde para aumentar e o vermelho para diminuir o BPM (%d-%d)\n", MIN_BPM, MAX_BPM);
+    printf("Use o botão azul para aumentar e o vermelho para diminuir o BPM (%d-%d)\n", MIN_BPM, MAX_BPM);
 }
